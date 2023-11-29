@@ -1,0 +1,207 @@
+---
+title: "R Processing of Empirical Hamlets"
+author: "Kate Shih"
+date: "2023-11-04"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document will guide you how to apply R to generate Empirical Hamlets using OSM building centroids and conduct population estimation for the hamlets.
+
+```{r warning = FALSE, message = FALSE}
+#Allow R to load required algorithms
+library(sp)
+library(sf)
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(extraDistr)
+```
+
+## Step 1. Upload your OSM building centroids .shp
+
+After running the codes, another window will be open and direct to the folder where the shapefile is then click "Open".
+The file will be loaded.
+
+After loading completely, an output will show the number of OSM buildings points we have.
+
+```{r}
+hh_all<-st_read(file.choose())
+
+nrow(hh_all)
+```
+
+## Step 2. Clean building points
+
+Because we are targeting "population households" and they are not likely to be labeled with "Name" on the map, we removed points labeled with "Name".
+
+After filtering completely, an output will show the number of clean points we have.
+
+```{r}
+hh<-hh_all %>% 
+  filter(is.na(name)|is.na(name))%>% 
+  dplyr::select(osm_id,longitude,latitude) 
+
+nrow(hh)
+```
+
+## Step 3. Transform the spatial data to a general data table
+
+To conduct K-means clustering, we need to extract the spatial coordinates into a plain data table.
+
+```{r}
+hh.loc<-as.data.frame(st_coordinates(hh))
+```
+
+## Step 4. Apply K-means clustering to building centroids
+
+The core concept of "Empirical Hamlets" is hamlets consist of clustering of households.
+To apply K-means clustering, we need to pre-define "K", the number of clusters we would like to generate.
+We refer the denominator from the real hamlets in India.
+In average, 51 households (14376/282) would compose one hamlet.
+
+"km" is the output of K-means clustering and it contains lists of:
+
+1.  cluster: A vector of integers (from 1:k) indicating the cluster to which each point is allocated.
+
+2.  centers: A matrix of cluster centers.
+
+3.  size: The number of points in each cluster.
+
+*###Setting a seed allows us to get the same result every time we run the code.*
+
+*###A iteration time of 50 should be sufficient to have the algorithm to coverge.*
+
+*###Please be patient. We have quite a huge dataset...*
+
+```{r}
+k<-round(nrow(hh.loc)/(14376/282),0)
+set.seed(123)
+km <-kmeans(hh.loc, k, iter.max = 50, trace = T)
+```
+
+## Step 5. Conduct population estimation
+
+Here we applied District population as our reference; therefore, we need to upload district shapefile [adm2.shp] and population csv [Dist_CEN_2021.csv] first.
+Next, we intersected (st_join) the building centroids with districts to identify which district the building is located.
+Then, we can simulate the household size for each building point based on the mean household size of that district.
+The algorithm was randomized under zero-truncated Possion distribution (rtpois).
+
+```{r}
+#upload district shapefile
+adm2<-st_read(file.choose())
+
+#upload district population data
+adm2_pop<-read.csv(file.choose())
+
+#join population to district shapefile
+adm2<-left_join(adm2,adm2_pop,join_by(ADM2_PCODE==ADM2_PCODE))
+
+#just to reduce the data table size
+adm2<-adm2 %>% 
+  dplyr::select(ADM2_EN,ADM2_PCODE,HH_SIZE,TOT_POP)
+
+#add k-means cluster result to the building centroid dataset
+hh$kmcluster<-km$cluster
+
+hh_in <- st_join(hh, adm2, join = st_within)
+
+#just a reference table to know how many districts are within scope
+count<-count(as_tibble(hh_in), ADM2_PCODE)
+
+#hh_size is the simulated household size
+hh_in$hh_size<-vector(length=nrow(hh_in))
+for (i in 1:nrow(count)){
+  pp.size<-adm2$HH_SIZE[adm2$ADM2_PCODE==count$ADM2_PCODE[i]] #District HOUSEHOLD
+  pp.pop<-adm2$TOT_POP[adm2$ADM2_PCODE==count$ADM2_PCODE[i]] #TOTAL POPULATION
+  set.seed(10)
+  size<-rtpois(count$n[i], pp.pop/pp.size, a = 0, b = Inf)
+  hh_in$hh_size[hh_in$ADM2_PCODE==count$ADM2_PCODE[i]]<-size
+}
+
+#Consize the 'hh_in' dataset
+hh_in<-hh_in %>% 
+  dplyr::select(osm_id,longitude,latitude,ADM2_EN,ADM2_PCODE,kmcluster,hh_size)
+
+```
+
+## Step 6. Set up Hamlet Center Dataset
+
+To complete the population esimation of each hamlet, we just need to sum up 'hh_size' of the same cluster from building centroids.
+Meanwhile, we will set up a point shapefile [center] as the centroid dataset for our empirical hamlets with variables of household numbers ('size') and population estimates ('pop_est').
+
+```{r}
+cen<-as.data.frame(km[["centers"]])
+cen$kmcluster<-1:k
+cen$size<-
+  unlist(km$size)
+center<-st_as_sf(cen, coords = c("X","Y"), crs=4326, remove = FALSE)
+
+#just to add which district this hamlet locates
+adm2c<-adm2 %>% 
+  dplyr::select(ADM2_EN,ADM2_PCODE)
+c_in2 <- st_join(center, adm2c, join = st_within)
+center$ADM2_EN<-c_in2$ADM2_EN
+center$ADM2_PCODE<-c_in2$ADM2_PCODE
+
+#pop_est is the population estimates of our hamlet
+center$pop_est<-vector(length=nrow(center))
+for (i in 1:k){
+  cluster_hh<-hh_in %>% 
+    filter(kmcluster==i)
+  center$pop_est[center$kmcluster==i]<-sum(cluster_hh$hh_size)
+}
+```
+
+## Step 7. Set up Building Polygong Dataset
+
+Next, we will upload the building polygon shapefile and then join the variables of cluster ('kmcluster') and household size ('hh_size') for further applications.
+
+```{r}
+hhp<-st_read(file.choose())
+
+hhp<-hhp %>% 
+  dplyr::select(osm_id) %>% 
+  filter(osm_id %in% hh_in$osm_id)
+
+dt<-hh_in %>% 
+  dplyr::select(osm_id,kmcluster,ADM2_EN,ADM2_PCODE,hh_size) %>% 
+  st_drop_geometry()
+
+hhp<-left_join(hhp,dt,join_by(osm_id==osm_id))
+```
+
+## Step 8. Export the results!!!
+
+Now, we can save our results!
+We will export 3 shapefiles:
+
+1.  center: the centroids of our empirical hamlets with hamlet sequence ('kmcluser'), hamlet size ('size'), and population estimates ('pop_size').
+
+2.  hh_in: the centroids of building with hamlet sequence ('kmcluser'), household size estimates ('hh_size').
+
+3.  hhp: the building polygon with hamlet sequence ('kmcluser'), household size estimates ('hh_size').
+
+*###The exporting code is a bit trickier than uploading.* *###Please follow the instruction within the codes.*
+
+```{r}
+#To avoid OSMID alternation during data writing, we transform the data type
+hh_in$osm_id<-as.character(hh_in$osm_id)
+hhp$osm_id<-as.character(hhp$osm_id)
+
+#Inside the bracket, please replace your Folder path, and be aware of the direction "/"
+setwd("E:/Nepal/Settlement/final")
+
+#Then run these lines directly!
+st_write(center,"EmpiricalHamlets_Centroids.shp")
+st_write(hh_in,"HamletsBuilding_Centroids.shp")
+st_write(hhp,"HamletsBuilding_Polygon.shp")
+```
